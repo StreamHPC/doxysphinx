@@ -8,15 +8,38 @@
 # =====================================================================================
 """The toc module contains classes related to the toctree generation for doxygen htmls/rsts."""
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
+from enum import Enum, auto
+from itertools import chain
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Protocol, Tuple
+from typing import (
+    Any,
+    ClassVar,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+)
+from xml.etree.ElementTree import (
+    Element as XMLElement,  # nosec: B405 #https://github.com/PyCQA/bandit/issues/709
+)
+
+import defusedxml.ElementTree
+from packaging.version import Version
 
 from doxysphinx.doxygen import read_js_data_file
 from doxysphinx.utils.files import write_file
 from doxysphinx.utils.iterators import apply
+
+_logger = logging.getLogger()
 
 
 class TocGenerator(Protocol):
@@ -28,7 +51,7 @@ class TocGenerator(Protocol):
     method. The implementer has then to choose how to implement the toc generation.
     """
 
-    def __init__(self, source_dir: Path):
+    def __init__(self, source_dir: Path, tagfile: Optional[Path]):
         """
         Initialize an instance of a TocGenerator.
 
@@ -128,6 +151,262 @@ class _MenuEntry:
         return unique_children
 
 
+class _CompoundKind(Enum):
+    """\"Kind\" value in tag-file."""
+
+    CATEGORY = auto()
+    CLASS = auto()
+    CONCEPT = auto()
+    DIR = auto()
+    ENUM = auto()
+    EXCEPTION = auto()
+    FILE = auto()
+    GROUP = auto()
+    INDEX_PAGE = auto()  # The index page, this doesn't appear in xml directly but needs special handling
+    INTERFACE = auto()
+    MODULE = auto()
+    NAMESPACE = auto()
+    PAGE = auto()
+    PROTOCOL = auto()
+    SERVICE = auto()
+    SINGLETON = auto()
+    STRUCT = auto()
+    TYPE = auto()
+    UNION = auto()
+    UNKNOWN = auto()
+
+    @classmethod
+    def from_str(cls, kind_str: str) -> "_CompoundKind":
+        """Get the kind corresponding to the str kind_str.
+
+        returns _CompoundKind.UNKNOWN if not defined
+        """
+        kind = kind_str.upper()
+        try:
+            return cls[kind]
+        except KeyError:
+            _logger.warning(f"Unknown compound type {kind_str}")
+            return cls.UNKNOWN
+
+
+@dataclass
+class _Compound:
+    """Representation of <compound> from the tagfile."""
+
+    class Ref(NamedTuple):
+        """Reference to a _Compound, uniquely identifying it."""
+
+        kind: _CompoundKind
+        name: str
+
+    kind: _CompoundKind
+    name: str
+    title: str
+    filename: str
+    children: List["_Compound.Ref"] = field(default_factory=list)
+
+    CLASS_ALIASES: ClassVar[List[_CompoundKind]] = [
+        _CompoundKind.CATEGORY,
+        _CompoundKind.CLASS,
+        _CompoundKind.ENUM,
+        _CompoundKind.EXCEPTION,
+        _CompoundKind.INTERFACE,
+        _CompoundKind.MODULE,
+        _CompoundKind.PROTOCOL,
+        _CompoundKind.SERVICE,
+        _CompoundKind.SINGLETON,
+        _CompoundKind.TYPE,
+    ]
+
+    @property
+    def ref(self) -> "_Compound.Ref":
+        """The Reference to this instance."""
+        return _Compound.Ref(self.kind, self.name)
+
+    @classmethod
+    def from_xml(cls, compound: XMLElement) -> "_Compound":
+        """Parse a <compound> from XML."""
+        kind_attr = compound.get("kind")
+        if kind_attr is None:
+            raise Exception("Couldn't parse tagfile, expected \"kind\" attribute wasn't found")
+
+        kind = _CompoundKind.from_str(kind_attr)
+        values: Dict[str, str] = {}
+        required_keys: Iterable[str]
+
+        if kind == _CompoundKind.GROUP:
+            required_keys = ("name", "title", "filename")
+        else:
+            required_keys = ("name", "filename")
+
+        for key in required_keys:
+            if kind != _CompoundKind.GROUP and key == "title":
+                continue
+
+            node = compound.find(key)
+            if node is None:
+                raise Exception(f"Couldn't parse tagfile, expected sub-element {key}, but it wasn't found")
+            if node.text is None:
+                raise Exception(f"Couldn't parse tagfile, expected {key} to have a value, but it's empty")
+            text: str = node.text
+            values[key] = text
+
+        title = values["title"] if "title" in values else values["name"]
+        # We need to special case the index page, it shouldn't appear where other pages appear,
+        # because it is already used as the root of the TOC hierarchy
+        if kind == _CompoundKind.PAGE and values["name"] == "index":
+            kind = _CompoundKind.INDEX_PAGE
+
+        return cls(
+            kind=kind,
+            name=values["name"],
+            title=title,
+            filename=values["filename"],
+            children=cls._get_children(compound, kind),
+        )
+
+    _CHILD_NODE_NAMES: ClassVar[Dict[_CompoundKind, str]] = {
+        _CompoundKind.CLASS: "class",
+        _CompoundKind.DIR: "dir",
+        _CompoundKind.GROUP: "subgroup",
+        _CompoundKind.NAMESPACE: "namespace",
+        _CompoundKind.PAGE: "subpage",
+    }
+
+    @classmethod
+    def _child_tag_for(cls, kind: _CompoundKind) -> Optional[str]:
+        if kind in cls.CLASS_ALIASES:
+            return cls._CHILD_NODE_NAMES[_CompoundKind.CLASS]
+
+        if kind == _CompoundKind.INDEX_PAGE:
+            return cls._CHILD_NODE_NAMES[_CompoundKind.PAGE]
+
+        return cls._CHILD_NODE_NAMES.get(kind)
+
+    @classmethod
+    def _get_children(cls, compound: XMLElement, kind: _CompoundKind) -> List["_Compound.Ref"]:
+        child_tag = cls._child_tag_for(kind)
+        if child_tag is None:
+            return []
+
+        children: List["_Compound.Ref"] = []
+        for subnode in compound.iterfind(f"./{child_tag}"):
+            child_kind = kind  # Children are by default the same kind as the parent if not specified otherwise
+            kind_attr = subnode.get("kind")
+            if kind_attr is not None:
+                child_kind = _CompoundKind.from_str(kind_attr)
+
+            if subnode.text is None:
+                raise Exception(f"Couldn't parse tagfile, expected {child_tag} tag to have a value, but its empty")
+            child_name = subnode.text
+            # Sub-pages are declared with the (.html) file extension for some reason
+            if child_tag == "subpage":
+                child_name = child_name.rsplit(".", maxsplit=1)[0]
+            children.append(cls.Ref(child_kind, child_name))
+
+        return children
+
+
+class _DoxygenTagFileCompounds:
+    """Compounds from the tagfile."""
+
+    def __init__(self, tagfile: Path) -> None:
+        """Parse the tagfile and create the list of compounds from it."""
+        self._compounds_by_name: Dict[_CompoundKind, Dict[str, _Compound]] = {}
+        self._doxygen_version: Optional[Version]
+        self._compounds_with_parents_cache: Optional[Set[_Compound.Ref]] = None
+        self._parse(tagfile)
+
+    @property
+    def doxygen_version(self) -> Optional[Version]:
+        """Version of doxygen that wrote the tagfile, or None if no version was written."""
+        return self._doxygen_version
+
+    def compounds_by_name(self, kind: _CompoundKind) -> Dict[str, _Compound]:
+        """Get a dictionary with all compounds of kind, with the compound names as keys."""
+        return self._compounds_by_name[kind]
+
+    def __getitem__(self, key: _Compound.Ref) -> _Compound:
+        """Get a compound based on its reference."""
+        return self._compounds_by_name[key.kind][key.name]
+
+    @property
+    def kinds(self) -> Iterable[_CompoundKind]:
+        """The compound kinds found in the tagfile."""
+        return self._compounds_by_name.keys()
+
+    def roots(self, kind: _CompoundKind) -> Iterable[_Compound.Ref]:
+        """Get the compounds of kind with no parents, i.e. the roots of the hierarchy for kind."""
+        compounds = {_Compound.Ref(kind, name) for name in self._compounds_by_name[kind]}
+        return compounds - self._compounds_with_parents
+
+    def _parse(self, tagfile: Path) -> None:
+        root = defusedxml.ElementTree.parse(tagfile).getroot()
+        if root is None:
+            raise Exception('Couldn\'t parse tagfile "tagfile" tag not found')
+
+        self._doxygen_version = self._parse_doxygen_version(root)
+
+        for node in root.iterfind("./compound"):
+            compound = _Compound.from_xml(node)
+            self._compounds_by_name.setdefault(compound.kind, {})[compound.name] = compound
+
+    @staticmethod
+    def _parse_doxygen_version(root: XMLElement) -> Optional[Version]:
+        version_attrib = root.get("doxygen_version")
+        if version_attrib is not None:
+            return Version(version_attrib)
+
+        # Earlier versions have a separate <doxygen> tag with a "version" attrobute
+        doxygen_tag = root.find("./doxygen")
+        if not doxygen_tag:
+            return None
+
+        version_attrib = doxygen_tag.get("version")
+        if version_attrib is not None:
+            return Version(version_attrib)
+
+        return None
+
+    @property
+    def _compounds_with_parents(self) -> Set[_Compound.Ref]:
+        if self._compounds_with_parents_cache is not None:
+            return self._compounds_with_parents_cache
+
+        all_compounds = chain.from_iterable(self._compounds_by_name[k].values() for k in self._compounds_by_name)
+        self._compounds_with_parents_cache = set(chain.from_iterable(c.children for c in all_compounds))
+
+        return self._compounds_with_parents_cache
+
+
+class _CompoundConverter:
+    """Converter from the XML format to _MenuEntries."""
+
+    def __init__(self, compounds: _DoxygenTagFileCompounds):
+        """Create a converter."""
+        self.compounds = compounds
+        self._menu_entries: Dict[_Compound.Ref, _MenuEntry] = {}
+
+    def _get_or_create_entry_for(self, ref: _Compound.Ref) -> _MenuEntry:
+        if ref in self._menu_entries:
+            return self._menu_entries[ref]
+
+        compound = self.compounds[ref]
+        entry = _MenuEntry(
+            title=compound.title,
+            docname=_MenuEntry._docname_from_url(compound.filename),
+            url=compound.filename,
+            children=[self._get_or_create_entry_for(i) for i in compound.children],
+        )
+        self._menu_entries[compound.ref] = entry
+        return entry
+
+    def roots(self, kind: _CompoundKind) -> Iterable[_MenuEntry]:
+        """Get an iterator to the root entries for the compounds of kind."""
+        # Adds all groups to self._menu_entries as a side-effect, because all entries are reachable from the roots
+        return (self._get_or_create_entry_for(r) for r in self.compounds.roots(kind))
+
+
 class DoxygenTocGenerator:
     """
     A TocGenerator for doxygen.
@@ -136,7 +415,7 @@ class DoxygenTocGenerator:
     directive needs to be generated or not.
     """
 
-    def __init__(self, source_dir: Path):
+    def __init__(self, source_dir: Path, tagfile: Optional[Path]):
         """
         Initialize an instance of a TocGenerator.
 
@@ -154,9 +433,80 @@ class DoxygenTocGenerator:
         apply(structural_dummies, self._prepare_structural_dummy)
         apply(structural_dummies, self._create_toc_file_for_structural_dummy)
 
-        self._menu_lookup: Dict[str, _MenuEntry] = {
-            e.docname: e for e in self._flatten_tree(self._menu) if not e.is_leaf
-        }
+        self._menu_lookup: Dict[str, _MenuEntry] = self._create_menu_lookup(tagfile)
+
+    _MENU_FILENAME_FOR_KIND: ClassVar[Dict[_CompoundKind, str]] = {
+        _CompoundKind.PAGE: "pages",
+        _CompoundKind.MODULE: "modules",
+        _CompoundKind.NAMESPACE: "namespaces",
+        # Disabled currently, because it would need more structure (e.g. grouping by namespace)
+        # _CompoundKind.CONCEPT: "concepts",
+        # _CompoundKind.CLASS: "annotated",
+        # _CompoundKind.INTERFACE: "annotatedinterfaces",
+        # _CompoundKind.STRUCT: "annotatedstructs",
+        # _CompoundKind.EXCEPTION: "annotatedexceptions",
+        # Similarly to classes, more structure would be required to present nicely.
+        # _CompoundKind.FILE: "files",
+    }
+
+    @classmethod
+    def _menu_filename_for(cls, kind: _CompoundKind, compounds: _DoxygenTagFileCompounds) -> Optional[str]:
+        if kind == _CompoundKind.GROUP:
+            if compounds.doxygen_version is not None and compounds.doxygen_version >= Version("1.9.8"):
+                return "topics"
+            return "modules"
+
+        return cls._MENU_FILENAME_FOR_KIND.get(kind)
+
+    def _extend_with_kind(
+        self, kind: _CompoundKind, *, menu_lookup: Dict[str, _MenuEntry], converter: _CompoundConverter
+    ) -> None:
+        menu_parent = self._menu_filename_for(kind, converter.compounds)
+        _logger.debug(f"menu_parent: {menu_parent}")
+        if menu_parent is None:
+            return
+
+        if menu_parent not in menu_lookup:
+            _logger.debug("skipping")
+            return
+
+        # Flatten and merge the new keys into menu_lookup
+        menu_lookup.update(
+            (e.docname, e) for e in chain.from_iterable((self._flatten_tree(root) for root in converter.roots(kind)))
+        )
+        children: List[_MenuEntry] = menu_lookup[menu_parent].children
+        children.extend(converter.roots(kind))
+
+        menu_lookup[menu_parent] = replace(menu_lookup[menu_parent], children=children)
+
+    def _extend_menu_with_tagfile(self, menu_lookup: Dict[str, _MenuEntry], tagfile: Optional[Path]) -> None:
+        compounds = self._parse_tagfile(tagfile)
+        if compounds is None:
+            return
+
+        converter = _CompoundConverter(compounds)
+        for kind in compounds.kinds:
+            _logger.debug(f"Extending with kind: {kind}")
+            self._extend_with_kind(kind, menu_lookup=menu_lookup, converter=converter)
+
+    def _create_menu_lookup(self, tagfile: Optional[Path]) -> Dict[str, _MenuEntry]:
+        menu_lookup = {e.docname: e for e in self._flatten_tree(self._menu)}
+        self._extend_menu_with_tagfile(menu_lookup, tagfile)
+        return menu_lookup
+
+    @staticmethod
+    def _parse_tagfile(tagfile: Optional[Path]) -> Optional[_DoxygenTagFileCompounds]:
+        if tagfile is None:
+            _logger.info("Skipping toc generation, tagfile not specified")
+            return None
+
+        try:
+            parser = _DoxygenTagFileCompounds(tagfile)
+            return parser
+        except FileNotFoundError as err:
+            _logger.warning(f"Failed to parse tagfile: {err}")
+            _logger.info("Skipping toc generation")
+            return None
 
     def _parse_template(self) -> Tuple[str, str]:
         """Parse a "doxygen html template shell" out of the index.html file.
@@ -239,7 +589,7 @@ class DoxygenTocGenerator:
         write_file(file, content)
 
     def _load_menu_tree(self, menu_data_js_path: Path) -> _MenuEntry:
-        menu = read_js_data_file(menu_data_js_path)
+        menu = read_js_data_file(menu_data_js_path)["menudata"]
         items = menu["children"]
 
         children = [_MenuEntry.from_json_node(c) for c in items]
@@ -265,6 +615,7 @@ class DoxygenTocGenerator:
         """
         name = file.stem
         if name in self._menu_lookup:
+            _logger.debug(f"Generating toc for {name}")
             matching_menu_entry = self._menu_lookup[name]
 
             children = matching_menu_entry.children

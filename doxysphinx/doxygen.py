@@ -15,7 +15,7 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import pyjson5
 
@@ -143,7 +143,7 @@ class DoxygenSettingsValidator:
 
     mandatory_settings = {
         "OUTPUT_DIRECTORY": "",
-        "GENERATE_TREEVIEW": "NO",
+        # "GENERATE_TREEVIEW": "NO",
         "DISABLE_INDEX": "NO",
         # "ALIASES": ["rst=\\verbatim embed:rst:leading-asterisk", "endrst=\\endverbatim"],
         "GENERATE_HTML": "YES",
@@ -178,6 +178,8 @@ class DoxygenSettingsValidator:
     """List of the validation errors including the doxyflag with its used and the correct value."""
     absolute_out: Path
     """Absolute path of the output directory."""
+    tagfile: Optional[Path]
+    """Absolute path to the tagfile if present"""
     validation_msg = ""
     """Validation errors merged in one string."""
 
@@ -218,6 +220,11 @@ class DoxygenSettingsValidator:
         stringified_out = str(out) if out.is_absolute() else f'"{out}" (resolved to "{self.absolute_out}")'
 
         self.mandatory_settings["OUTPUT_DIRECTORY"] = Path(cast(str, config["OUTPUT_DIRECTORY"])).as_posix()
+
+        if "GENERATE_TAGFILE" not in config:
+            self.tagfile = None
+        else:
+            self.tagfile = path_resolve(doxygen_cwd / cast(str, config["GENERATE_TAGFILE"]))
 
         if path_is_relative_to(out, sphinx_source_dir):
             self.optional_settings["GENERATE_TAGFILE"] = out.joinpath("tagfile.xml").relative_to(doxygen_cwd).as_posix()
@@ -301,7 +308,8 @@ def read_js_data_file(js_data_file: Path) -> Any:
     :return: a json like dict of the data.
     """
     data = js_data_file.read_text(encoding="utf-8")
-    sanitized = re.sub(r"var .*=", "", data)
+    sanitized = "{\n" + re.sub(r"var\s+([a-zA-Z][a-zA-Z_]*)\s*=", r'"\1":', data) + "\n}"
+    sanitized = sanitized.replace(";", ",")
     result: Any = pyjson5.loads(sanitized)
     return result
 

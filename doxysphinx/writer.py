@@ -14,7 +14,7 @@ import re
 from itertools import chain
 from pathlib import Path
 from textwrap import dedent
-from typing import Iterator, List, Protocol, Type, Union
+from typing import Iterator, List, Optional, Protocol, Type, Union
 
 from lxml import etree  # nosec: B410, pylint: disable=import-error
 from lxml.etree import _ElementTree  # nosec: B410, pylint: disable=import-error
@@ -29,7 +29,12 @@ from doxysphinx.utils.files import write_file
 class Writer(Protocol):
     """Protocol representing a Writer that write docs-as-code files."""
 
-    def __init__(self, source_directory: Path, toc_generator_type: Type[TocGenerator] = DoxygenTocGenerator):
+    def __init__(
+        self,
+        source_directory: Path,
+        tagfile: Optional[Path],
+        toc_generator_type: Type[TocGenerator] = DoxygenTocGenerator,
+    ):
         """
         Writer constructor protocol.
 
@@ -37,6 +42,8 @@ class Writer(Protocol):
             Sometimes it's necessary to amend the generated rsts/output files with
             additional data from source directory (typically e.g. to generate a toc).
             For this reason the source directory is an input here
+        :param tagile: The location of the doxygen tagfile. Similarly to source_directory, this might be
+            used for toc generation.
         :param toc_generator_type: the type to use for generating the toc (has to adhere
             the :class:`TocGenerator` protocol.
         """
@@ -66,14 +73,20 @@ class RstWriter:
     # regex for searching inline elements
     _rst_element_regex = re.compile(r"<snippet type=\"(?P<type>.*?)\">((?P<inline_content>.*?)</snippet>)?$")
 
-    def __init__(self, source_directory: Path, toc_generator_type: Type[TocGenerator] = DoxygenTocGenerator):
+    def __init__(
+        self,
+        source_directory: Path,
+        tagfile: Optional[Path],
+        toc_generator_type: Type[TocGenerator] = DoxygenTocGenerator,
+    ):
         """
         Create a new rst writer.
 
         :param source_directory: Source directory of html files.
+        :param tagfile: Path to Doxygen tagfile
         :param toc_generator_type: The toc generator to use.
         """
-        self._toc_gen = toc_generator_type(source_directory)
+        self._toc_gen = toc_generator_type(source_directory, tagfile)
 
         # cached translation map for safe encoding rst text
         self._rst_safe_encode_map = str.maketrans(

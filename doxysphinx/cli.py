@@ -31,7 +31,7 @@ import importlib.metadata as metadata
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List
+from typing import Iterator, List, NamedTuple, Optional
 
 import click
 import click_log  # type: ignore
@@ -103,6 +103,12 @@ def cli():
 
 @cli.command()
 @click.option(
+    "--tagfile_toc/--no_tagfile_toc",
+    type=bool,
+    default=False,
+    help="Parse the doxygen tagfile to create a more accurate table of contents for sphinx, off by default.",
+)
+@click.option(
     "--parallel/--sequential",
     default=True,
     help="parallel will separate the work among all available processor cores where possible while sequential "
@@ -112,7 +118,7 @@ def cli():
 @click.argument("sphinx_source", type=click.Path(file_okay=False, exists=True, path_type=Path))
 @click.argument("sphinx_output", type=click.Path(file_okay=False, path_type=Path))
 @_doxygen_context()
-def build(parallel: bool, sphinx_source: Path, sphinx_output: Path, **kwargs):
+def build(tagfile_toc: bool, parallel: bool, sphinx_source: Path, sphinx_output: Path, **kwargs):
     """
     Build rst and copy related files for doxygen projects.
 
@@ -130,9 +136,9 @@ def build(parallel: bool, sphinx_source: Path, sphinx_output: Path, **kwargs):
     doxy_context = DoxygenContext(**kwargs)
     _logger.info("starting build command...")
     with TimedContext() as timed_scope:
-        builder = Builder(sphinx_source, sphinx_output, parallel=parallel)
-        for doxy_output in _get_doxygen_outdirs(doxy_context, sphinx_source):
-            builder.build(doxy_output)
+        builder = Builder(sphinx_source, sphinx_output, enable_tagfile_toc=tagfile_toc, parallel=parallel)
+        for params in _get_doxygen_params(doxy_context, sphinx_source):
+            builder.build(params.outdir, params.tagfile)
     _logger.info(f"build command done in {timed_scope.elapsed_humanized()} ({timed_scope.elapsed()}).")
 
 
@@ -159,20 +165,27 @@ def clean(parallel: bool, sphinx_source: Path, sphinx_output: Path, **kwargs):
     _logger.info("starting clean command...")
     with TimedContext() as tc:
         cleaner = Cleaner(sphinx_source, sphinx_output, parallel=parallel)
-        for doxy_output in _get_doxygen_outdirs(doxy_context, sphinx_source):
-            cleaner.cleanup(doxy_output)
+        for params in _get_doxygen_params(doxy_context, sphinx_source):
+            cleaner.cleanup(params.outdir)
     _logger.info(f"clean command done in {tc.elapsed_humanized()}.")
 
 
-def _get_doxygen_outdirs(doxy_context: DoxygenContext, sphinx_source: Path) -> Iterator[Path]:
+class DoxygenParams(NamedTuple):
+    """Doxygen Parameters read from doxyfile or passed on the command line."""
+
+    outdir: Path
+    tagfile: Optional[Path]
+
+
+def _get_doxygen_params(doxy_context: DoxygenContext, sphinx_source: Path) -> Iterator[DoxygenParams]:
     for i in doxy_context.input:
         if i.is_dir():
-            yield _get_outdir_via_doxyoutputdir(i)
+            yield _get_params_via_doxyoutputdir(i)
         else:
-            yield _get_outdir_via_doxyfile(i, sphinx_source, doxy_context)
+            yield _get_params_via_doxyfile(i, sphinx_source, doxy_context)
 
 
-def _get_outdir_via_doxyfile(doxyfile: Path, sphinx_source: Path, doxy_context: DoxygenContext) -> Path:
+def _get_params_via_doxyfile(doxyfile: Path, sphinx_source: Path, doxy_context: DoxygenContext) -> DoxygenParams:
     config = read_doxyconfig(doxyfile, doxy_context.doxygen_exe, doxy_context.doxygen_cwd)
 
     validator = DoxygenSettingsValidator()
@@ -187,15 +200,15 @@ def _get_outdir_via_doxyfile(doxyfile: Path, sphinx_source: Path, doxy_context: 
         logging.warning("Not all optional doxygen settings are set correctly:\n")
         logging.warning(f"{validator.validation_msg}")
 
-    return validator.absolute_out
+    return DoxygenParams(validator.absolute_out, validator.tagfile)
 
 
-def _get_outdir_via_doxyoutputdir(doxygen_html_output_dir: Path) -> Path:
+def _get_params_via_doxyoutputdir(doxygen_html_output_dir: Path) -> DoxygenParams:
     validator = DoxygenOutputPathValidator()
     if not validator.validate(doxygen_html_output_dir):
         raise click.UsageError(validator.validation_msg)
 
-    return doxygen_html_output_dir
+    return DoxygenParams(doxygen_html_output_dir, None)
 
 
 if __name__ == "__main__":

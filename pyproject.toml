@@ -9,7 +9,7 @@
 
 [tool.poetry]
 name = "doxysphinx"
-version = "3.3.7"
+version = "3.3.7+tagfile.toc"
 description = "Integrates doxygen html documentation with sphinx."
 authors = [
     "Nirmal Sasidharan <nirmal.sasidharan@de.bosch.com>",
@@ -45,6 +45,7 @@ pyparsing = "^3.0.9"
 mpire = "^2.6.0"
 pyjson5 = "^1.6.2"
 libsass = "^0.22.0"
+defusedxml = "^0.7.1"
 
 [tool.poetry.group.sphinx.dependencies]
 sphinx = "<7"

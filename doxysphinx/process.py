@@ -49,6 +49,7 @@ class Builder:
         parser_type: Type[HtmlParser] = DoxygenHtmlParser,
         writer_type: Type[Writer] = RstWriter,
         force_recreation: bool = False,
+        enable_tagfile_toc: bool = False,
         parallel=True,
     ):
         """
@@ -74,8 +75,9 @@ class Builder:
 
         self._force_recreation = force_recreation
         self._parallel = parallel
+        self._enable_tagfile_toc = enable_tagfile_toc
 
-    def build(self, doxygen_html_dir: Path):
+    def build(self, doxygen_html_dir: Path, tagfile: Optional[Path]):
         """
         Generate a rst file for each doxygen html file.
 
@@ -89,12 +91,12 @@ class Builder:
             f"copied {len(copied_resources)} resource-files " f"to {self._dir_mapper.map(doxygen_html_dir)}"
         )
 
-        created_rsts = self._build(doxygen_html_dir)
+        created_rsts = self._build(doxygen_html_dir, tagfile if self._enable_tagfile_toc else None)
         self._logger.info(f"created {len(created_rsts)} rst-files in {doxygen_html_dir}")
 
-    def _build(self, doxygen_html_dir: Path) -> List[Path]:
+    def _build(self, doxygen_html_dir: Path, tagfile: Optional[Path]) -> List[Path]:
         parser = self._parser_type(doxygen_html_dir)
-        writer = self._writer_type(doxygen_html_dir)
+        writer = self._writer_type(doxygen_html_dir, tagfile)
         task_args: Tuple[HtmlParser, Writer] = (parser, writer)
 
         files_with_hashes = list(self._get_doxy_htmls_to_process_with_hashes(doxygen_html_dir))

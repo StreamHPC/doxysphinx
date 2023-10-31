@@ -15,7 +15,7 @@ from doxysphinx.toc import DoxygenTocGenerator
 
 
 def test_tocgenerator_works_as_expected():
-    tocgen = DoxygenTocGenerator(Path(__file__).parent)
+    tocgen = DoxygenTocGenerator(Path(__file__).parent, None)
     path = Path("index.html")
     result = list(tocgen.generate_toc_for(path))
     assert result[0] == ".. toctree::"
