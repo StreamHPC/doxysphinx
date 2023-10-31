@@ -9,6 +9,7 @@
 """The toc module contains classes related to the toctree generation for doxygen htmls/rsts."""
 
 import logging
+import operator
 import re
 import unicodedata
 from dataclasses import dataclass, field, replace
@@ -304,6 +305,7 @@ class _Compound:
                 child_name = child_name.rsplit(".", maxsplit=1)[0]
             children.append(cls.Ref(child_kind, child_name))
 
+        children.sort(key=operator.attrgetter("name"))
         return children
 
 
@@ -350,6 +352,11 @@ class _DoxygenTagFileCompounds:
         for node in root.iterfind("./compound"):
             compound = _Compound.from_xml(node)
             self._compounds_by_name.setdefault(compound.kind, {})[compound.name] = compound
+
+        def sorted_dict(d: Dict[str, _Compound]) -> Dict[str, _Compound]:
+            return dict(sorted(d.items(), key=operator.itemgetter(0)))
+
+        self._compounds_by_name = {k: sorted_dict(v) for k, v in self._compounds_by_name.items()}
 
     @staticmethod
     def _parse_doxygen_version(root: XMLElement) -> Optional[Version]:
